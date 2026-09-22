@@ -1,10 +1,18 @@
+using ScreenCropAutomation.Models;
 using ScreenCropAutomation.Services;
 
 namespace ScreenCropAutomation.Controls;
 
+internal enum EditorTool
+{
+    Crop,
+    Rectangle,
+    Line
+}
+
 /// <summary>
-/// 可在 Zoom 預覽圖上拉出、拖曳與調整紅框的 PictureBox。
-/// 內部以影像相對比例（0~1）儲存裁切區，避免縮放誤差。
+/// 可在 Zoom 預覽圖上調整裁切紅框，或以小畫家方式畫矩形／直線。
+/// 標註與裁切分開：畫上去的線只屬於目前這張圖。
 /// </summary>
 internal sealed class CropPictureBox : PictureBox
 {
@@ -23,13 +31,17 @@ internal sealed class CropPictureBox : PictureBox
         ResizeSe,
         ResizeS,
         ResizeSw,
-        ResizeW
+        ResizeW,
+        Draw
     }
 
     private DragMode _mode = DragMode.None;
     private Point _dragStartClient;
     private RectangleF _dragStartCrop;
     private PointF _createStartNormalized;
+    private PointF _drawStartNormalized;
+    private PointF _drawEndNormalized;
+    private bool _drawingPreview;
 
     public CropPictureBox()
     {
@@ -39,12 +51,28 @@ internal sealed class CropPictureBox : PictureBox
         SetStyle(ControlStyles.OptimizedDoubleBuffer | ControlStyles.ResizeRedraw, true);
     }
 
+    public EditorTool Tool { get; set; } = EditorTool.Crop;
+
+    public Color DrawColor { get; set; } = Color.Red;
+
+    public float DrawThicknessPx { get; set; } = 3f;
+
+    public List<ImageAnnotation> Annotations { get; private set; } = [];
+
     /// <summary>相對於原始影像寬高的裁切矩形（X%, Y%, W%, H% 以 0~1 表示）。</summary>
     public RectangleF NormalizedCrop { get; private set; }
 
     public bool HasCrop => NormalizedCrop.Width >= MinNormalizedSize && NormalizedCrop.Height >= MinNormalizedSize;
 
     public event EventHandler? CropChanged;
+
+    public event EventHandler? AnnotationsChanged;
+
+    public void SetAnnotations(List<ImageAnnotation> annotations)
+    {
+        Annotations = annotations;
+        Invalidate();
+    }
 
     public void SetNormalizedCrop(RectangleF crop)
     {
@@ -60,11 +88,66 @@ internal sealed class CropPictureBox : PictureBox
         CropChanged?.Invoke(this, EventArgs.Empty);
     }
 
+    public void UndoLastAnnotation()
+    {
+        if (Annotations.Count == 0)
+        {
+            return;
+        }
+
+        Annotations.RemoveAt(Annotations.Count - 1);
+        Invalidate();
+        AnnotationsChanged?.Invoke(this, EventArgs.Empty);
+    }
+
+    public void ClearAnnotations()
+    {
+        if (Annotations.Count == 0)
+        {
+            return;
+        }
+
+        Annotations.Clear();
+        Invalidate();
+        AnnotationsChanged?.Invoke(this, EventArgs.Empty);
+    }
+
     protected override void OnPaint(PaintEventArgs pe)
     {
         base.OnPaint(pe);
+        if (Image is null)
+        {
+            return;
+        }
 
-        if (Image is null || !HasCrop)
+        Rectangle dest = PictureBoxImageMapper.GetImageDisplayRectangle(this);
+        if (dest.Width <= 0 || dest.Height <= 0)
+        {
+            return;
+        }
+
+        float scale = dest.Width / (float)Image.Width;
+        pe.Graphics.SmoothingMode = System.Drawing.Drawing2D.SmoothingMode.AntiAlias;
+
+        foreach (ImageAnnotation annotation in Annotations)
+        {
+            DrawAnnotation(pe.Graphics, annotation, dest, scale);
+        }
+
+        if (_drawingPreview)
+        {
+            var preview = new ImageAnnotation
+            {
+                Kind = Tool == EditorTool.Line ? AnnotationKind.Line : AnnotationKind.Rectangle,
+                Start = _drawStartNormalized,
+                End = _drawEndNormalized,
+                Color = DrawColor,
+                ThicknessPx = DrawThicknessPx
+            };
+            DrawAnnotation(pe.Graphics, preview, dest, scale);
+        }
+
+        if (!HasCrop)
         {
             return;
         }
@@ -90,6 +173,17 @@ internal sealed class CropPictureBox : PictureBox
             return;
         }
 
+        if (Tool is EditorTool.Line or EditorTool.Rectangle)
+        {
+            _mode = DragMode.Draw;
+            _drawStartNormalized = PictureBoxImageMapper.ClientToNormalized(this, e.Location);
+            _drawEndNormalized = _drawStartNormalized;
+            _drawingPreview = true;
+            Capture = true;
+            Invalidate();
+            return;
+        }
+
         _dragStartClient = e.Location;
         _dragStartCrop = NormalizedCrop;
         _mode = HitTest(e.Location);
@@ -110,7 +204,14 @@ internal sealed class CropPictureBox : PictureBox
 
         if (_mode == DragMode.None)
         {
-            Cursor = CursorForMode(HitTest(e.Location));
+            Cursor = Tool == EditorTool.Crop ? CursorForMode(HitTest(e.Location)) : Cursors.Cross;
+            return;
+        }
+
+        if (_mode == DragMode.Draw)
+        {
+            _drawEndNormalized = PictureBoxImageMapper.ClientToNormalized(this, e.Location);
+            Invalidate();
             return;
         }
 
@@ -124,6 +225,31 @@ internal sealed class CropPictureBox : PictureBox
         base.OnMouseUp(e);
         if (_mode == DragMode.None)
         {
+            return;
+        }
+
+        if (_mode == DragMode.Draw)
+        {
+            _drawEndNormalized = PictureBoxImageMapper.ClientToNormalized(this, e.Location);
+            float dx = _drawEndNormalized.X - _drawStartNormalized.X;
+            float dy = _drawEndNormalized.Y - _drawStartNormalized.Y;
+            if (Math.Sqrt((dx * dx) + (dy * dy)) >= 0.004)
+            {
+                Annotations.Add(new ImageAnnotation
+                {
+                    Kind = Tool == EditorTool.Line ? AnnotationKind.Line : AnnotationKind.Rectangle,
+                    Start = _drawStartNormalized,
+                    End = _drawEndNormalized,
+                    Color = DrawColor,
+                    ThicknessPx = DrawThicknessPx
+                });
+                AnnotationsChanged?.Invoke(this, EventArgs.Empty);
+            }
+
+            _drawingPreview = false;
+            _mode = DragMode.None;
+            Capture = false;
+            Invalidate();
             return;
         }
 
@@ -141,6 +267,28 @@ internal sealed class CropPictureBox : PictureBox
         Invalidate();
         CropChanged?.Invoke(this, EventArgs.Empty);
     }
+
+    private void DrawAnnotation(Graphics graphics, ImageAnnotation annotation, Rectangle dest, float scale)
+    {
+        PointF a = NormalizedToClientPoint(annotation.Start, dest);
+        PointF b = NormalizedToClientPoint(annotation.End, dest);
+        using var pen = ImageAnnotationService.CreatePen(annotation.Color, Math.Max(1f, annotation.ThicknessPx * scale));
+        if (annotation.Kind == AnnotationKind.Line)
+        {
+            graphics.DrawLine(pen, a, b);
+        }
+        else
+        {
+            float x = Math.Min(a.X, b.X);
+            float y = Math.Min(a.Y, b.Y);
+            float w = Math.Max(1f, Math.Abs(a.X - b.X));
+            float h = Math.Max(1f, Math.Abs(a.Y - b.Y));
+            graphics.DrawRectangle(pen, x, y, w, h);
+        }
+    }
+
+    private static PointF NormalizedToClientPoint(PointF normalized, Rectangle dest)
+        => new(dest.X + normalized.X * dest.Width, dest.Y + normalized.Y * dest.Height);
 
     private void ApplyDrag(Point currentClient)
     {

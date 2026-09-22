@@ -1,16 +1,24 @@
 using System.Media;
 using ScreenCropAutomation.Controls;
+using ScreenCropAutomation.Models;
 using ScreenCropAutomation.Native;
 using ScreenCropAutomation.Services;
 
 namespace ScreenCropAutomation;
 
 /// <summary>
-/// 主視窗：全域截圖、縮圖清單、批次套用裁切與一次複製全部圖片。
+/// 主視窗：全域截圖、裁切、單張標註（線／框）與批次套用裁切。
+/// 「全部套用」只套用裁切比例，不會把某一張的畫線／畫框套到其他圖。
 /// </summary>
 public sealed class MainForm : Form
 {
-    private readonly List<Bitmap> _captures = [];
+    private static readonly Color[] Palette =
+    [
+        Color.Black, Color.White, Color.Red, Color.Orange, Color.Gold,
+        Color.LimeGreen, Color.DeepSkyBlue, Color.Blue, Color.Magenta
+    ];
+
+    private readonly List<CaptureItem> _captures = [];
     private readonly ImageList _thumbnails = new()
     {
         ColorDepth = ColorDepth.Depth32Bit,
@@ -29,12 +37,17 @@ public sealed class MainForm : Form
     private Label _cropInfoLabel = null!;
     private Button _applyAllButton = null!;
     private Button _copyButton = null!;
+    private RadioButton _cropTool = null!;
+    private RadioButton _rectTool = null!;
+    private RadioButton _lineTool = null!;
+    private ComboBox _thicknessCombo = null!;
+    private Panel _colorSwatch = null!;
 
     public MainForm()
     {
         Text = "Screen Crop Automation — 截圖裁切小工具";
-        MinimumSize = new Size(1100, 700);
-        Size = new Size(1280, 800);
+        MinimumSize = new Size(980, 760);
+        Size = new Size(1280, 860);
         StartPosition = FormStartPosition.CenterScreen;
         KeyPreview = true;
         Font = new Font("Microsoft JhengHei UI", 9f);
@@ -60,9 +73,6 @@ public sealed class MainForm : Form
         base.OnFormClosed(e);
     }
 
-    /// <summary>
-    /// 攔截 Win32 訊息，將 WM_HOTKEY 交給 GlobalHotKey 處理。
-    /// </summary>
     protected override void WndProc(ref Message m)
     {
         if (_hotKey is not null && _hotKey.ProcessMessage(ref m))
@@ -81,6 +91,12 @@ public sealed class MainForm : Form
             return true;
         }
 
+        if (keyData == (Keys.Control | Keys.Z))
+        {
+            _preview.UndoLastAnnotation();
+            return true;
+        }
+
         return base.ProcessCmdKey(ref msg, keyData);
     }
 
@@ -93,9 +109,9 @@ public sealed class MainForm : Form
             RowCount = 3,
             Padding = new Padding(8)
         };
-        root.RowStyles.Add(new RowStyle(SizeType.Absolute, 56));
+        root.RowStyles.Add(new RowStyle(SizeType.Absolute, 52));
         root.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
-        root.RowStyles.Add(new RowStyle(SizeType.Absolute, 40));
+        root.RowStyles.Add(new RowStyle(SizeType.Absolute, 32));
 
         root.Controls.Add(BuildToolbar(), 0, 0);
 
@@ -103,7 +119,10 @@ public sealed class MainForm : Form
         {
             Dock = DockStyle.Fill,
             Orientation = Orientation.Vertical,
-            SplitterWidth = 6
+            SplitterWidth = 6,
+            // 建構當下尚未有實際寬度，MinSize 過大會直接讓程式開不起來。
+            Panel1MinSize = 50,
+            Panel2MinSize = 50
         };
 
         _listView = new ListView
@@ -121,13 +140,19 @@ public sealed class MainForm : Form
         {
             Dock = DockStyle.Fill,
             ColumnCount = 1,
-            RowCount = 2
+            RowCount = 3
         };
         previewPanel.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
-        previewPanel.RowStyles.Add(new RowStyle(SizeType.Absolute, 28));
+        previewPanel.RowStyles.Add(new RowStyle(SizeType.Absolute, 80));
+        previewPanel.RowStyles.Add(new RowStyle(SizeType.Absolute, 26));
 
-        _preview = new CropPictureBox { Dock = DockStyle.Fill };
+        _preview = new CropPictureBox
+        {
+            Dock = DockStyle.Fill,
+            MinimumSize = new Size(480, 320)
+        };
         _preview.CropChanged += (_, _) => UpdateCropInfo();
+        _preview.AnnotationsChanged += (_, _) => UpdateCropInfo();
 
         _cropInfoLabel = new Label
         {
@@ -137,7 +162,8 @@ public sealed class MainForm : Form
         };
 
         previewPanel.Controls.Add(_preview, 0, 0);
-        previewPanel.Controls.Add(_cropInfoLabel, 0, 1);
+        previewPanel.Controls.Add(BuildPaintBar(), 0, 1);
+        previewPanel.Controls.Add(_cropInfoLabel, 0, 2);
 
         _split.Panel1.Controls.Add(_listView);
         _split.Panel2.Controls.Add(previewPanel);
@@ -148,18 +174,190 @@ public sealed class MainForm : Form
         {
             Dock = DockStyle.Fill,
             TextAlign = ContentAlignment.MiddleLeft,
-            Text = "就緒。按下 F1 擷取主螢幕。"
+            Text = "就緒。按下快捷鍵擷取主螢幕。"
         };
         root.Controls.Add(_statusLabel, 0, 2);
 
         Controls.Add(root);
         Load += (_, _) =>
         {
-            if (_split.Width > 0)
-            {
-                _split.SplitterDistance = Math.Max(220, (int)(_split.Width * 0.24));
-            }
+            ApplySplitterLayout(initialize: true);
         };
+        SizeChanged += (_, _) => ApplySplitterLayout(initialize: false);
+    }
+
+    /// <summary>
+    /// 視窗變窄時優先縮小左側縮圖清單，保住右側裁切區與底部工具列寬度。
+    /// </summary>
+    private void ApplySplitterLayout(bool initialize)
+    {
+        if (!_split.IsHandleCreated || _split.Width < 80)
+        {
+            return;
+        }
+
+        const int preferredLeft = 168;
+        const int minLeft = 120;
+        const int minRight = 560;
+        int available = _split.Width - _split.SplitterWidth;
+        int rightFloor = minRight;
+        if (available < minLeft + minRight)
+        {
+            rightFloor = Math.Max(360, available - minLeft);
+        }
+
+        _split.Panel1MinSize = 50;
+        _split.Panel2MinSize = 50;
+
+        int maxLeft = Math.Max(minLeft, available - rightFloor);
+        int distance = initialize
+            ? Math.Min(preferredLeft, maxLeft)
+            : Math.Min(_split.SplitterDistance, maxLeft);
+        distance = Math.Clamp(distance, minLeft, Math.Max(minLeft, available - 50));
+
+        try
+        {
+            if (_split.SplitterDistance != distance)
+            {
+                _split.SplitterDistance = distance;
+            }
+
+            _split.Panel1MinSize = minLeft;
+            int remaining = available - _split.SplitterDistance;
+            if (remaining > 50)
+            {
+                _split.Panel2MinSize = Math.Min(rightFloor, remaining);
+            }
+        }
+        catch (InvalidOperationException)
+        {
+            // 縮放過程中 SplitContainer 尚未完成配置時略過。
+        }
+    }
+
+    private Control BuildPaintBar()
+    {
+        var bar = new FlowLayoutPanel
+        {
+            Dock = DockStyle.Fill,
+            WrapContents = true,
+            AutoScroll = false,
+            Padding = new Padding(0, 2, 0, 2)
+        };
+
+        bar.Controls.Add(MakeLabel("工具："));
+        _cropTool = MakeToolRadio("裁切", true);
+        _rectTool = MakeToolRadio("畫矩形", false);
+        _lineTool = MakeToolRadio("畫直線", false);
+        _cropTool.CheckedChanged += (_, _) => SetTool(EditorTool.Crop, _cropTool);
+        _rectTool.CheckedChanged += (_, _) => SetTool(EditorTool.Rectangle, _rectTool);
+        _lineTool.CheckedChanged += (_, _) => SetTool(EditorTool.Line, _lineTool);
+        bar.Controls.Add(_cropTool);
+        bar.Controls.Add(_rectTool);
+        bar.Controls.Add(_lineTool);
+
+        bar.Controls.Add(MakeLabel("顏色："));
+        foreach (Color color in Palette)
+        {
+            Color picked = color;
+            var chip = new Button
+            {
+                Width = 22,
+                Height = 22,
+                Margin = new Padding(1, 6, 1, 2),
+                BackColor = picked,
+                FlatStyle = FlatStyle.Flat,
+                TabStop = false
+            };
+            chip.FlatAppearance.BorderColor = Color.DimGray;
+            chip.Click += (_, _) => SetDrawColor(picked);
+            bar.Controls.Add(chip);
+        }
+
+        var moreColor = MakeButton("其他…", () =>
+        {
+            using var dialog = new ColorDialog { Color = _preview.DrawColor, FullOpen = true };
+            if (dialog.ShowDialog(this) == DialogResult.OK)
+            {
+                SetDrawColor(dialog.Color);
+            }
+        });
+        moreColor.Margin = new Padding(4, 4, 6, 2);
+        bar.Controls.Add(moreColor);
+
+        _colorSwatch = new Panel
+        {
+            Width = 28,
+            Height = 22,
+            Margin = new Padding(0, 8, 10, 2),
+            BackColor = _preview.DrawColor,
+            BorderStyle = BorderStyle.FixedSingle
+        };
+        bar.Controls.Add(_colorSwatch);
+
+        bar.Controls.Add(MakeLabel("粗細："));
+        _thicknessCombo = new ComboBox
+        {
+            DropDownStyle = ComboBoxStyle.DropDownList,
+            Width = 72,
+            Margin = new Padding(0, 6, 8, 2)
+        };
+        foreach (int px in new[] { 1, 2, 3, 5, 8, 12, 18 })
+        {
+            _thicknessCombo.Items.Add($"{px} px");
+        }
+
+        _thicknessCombo.SelectedIndex = 2;
+        _thicknessCombo.SelectedIndexChanged += (_, _) =>
+        {
+            string token = (_thicknessCombo.SelectedItem?.ToString() ?? "3 px").Split(' ')[0];
+            _preview.DrawThicknessPx = int.Parse(token);
+        };
+        bar.Controls.Add(_thicknessCombo);
+
+        bar.Controls.Add(MakeButton("復原標註", () => _preview.UndoLastAnnotation()));
+        bar.Controls.Add(MakeButton("清除此圖標註", () => _preview.ClearAnnotations()));
+        return bar;
+    }
+
+    private static Label MakeLabel(string text) => new()
+    {
+        Text = text,
+        AutoSize = true,
+        Margin = new Padding(4, 8, 2, 0)
+    };
+
+    private static RadioButton MakeToolRadio(string text, bool isChecked) => new()
+    {
+        Text = text,
+        AutoSize = true,
+        Appearance = Appearance.Button,
+        Checked = isChecked,
+        Margin = new Padding(0, 4, 4, 2),
+        Padding = new Padding(6, 3, 6, 3),
+        FlatStyle = FlatStyle.System
+    };
+
+    private void SetTool(EditorTool tool, RadioButton source)
+    {
+        if (!source.Checked)
+        {
+            return;
+        }
+
+        _preview.Tool = tool;
+        _statusLabel.Text = tool switch
+        {
+            EditorTool.Rectangle => "畫矩形：在目前這張圖上拖曳即可。標註不會套用到其他圖。",
+            EditorTool.Line => "畫直線：在目前這張圖上拖出任意方向的線。標註不會套用到其他圖。",
+            _ => "裁切：拖曳紅框。全部套用只會套用這個裁切區。"
+        };
+    }
+
+    private void SetDrawColor(Color color)
+    {
+        _preview.DrawColor = color;
+        _colorSwatch.BackColor = color;
     }
 
     private Control BuildToolbar()
@@ -269,7 +467,7 @@ public sealed class MainForm : Form
         try
         {
             Bitmap bitmap = ScreenCaptureService.CapturePrimaryScreen();
-            _captures.Add(bitmap);
+            _captures.Add(new CaptureItem(bitmap));
             AddThumbnail(bitmap, _captures.Count - 1);
             SelectIndex(_captures.Count - 1);
 
@@ -278,7 +476,7 @@ public sealed class MainForm : Form
                 SystemSounds.Asterisk.Play();
             }
 
-            _statusLabel.Text = $"已擷取第 {_captures.Count} 張（{_hotKey?.CurrentKey ?? Keys.F1}）。";
+            _statusLabel.Text = $"已擷取第 {_captures.Count} 張（{_hotKey?.CurrentKey ?? Keys.F2}）。";
             UpdateUiState();
         }
         catch (Exception ex)
@@ -315,11 +513,14 @@ public sealed class MainForm : Form
         if (index < 0)
         {
             _preview.Image = null;
+            _preview.SetAnnotations([]);
             UpdateCropInfo();
             return;
         }
 
-        _preview.Image = _captures[index];
+        CaptureItem item = _captures[index];
+        _preview.Image = item.Bitmap;
+        _preview.SetAnnotations(item.Annotations);
         UpdateCropInfo();
     }
 
@@ -332,6 +533,7 @@ public sealed class MainForm : Form
         }
 
         _preview.Image = null;
+        _preview.SetAnnotations([]);
         _captures[index].Dispose();
         _captures.RemoveAt(index);
         RebuildThumbnails();
@@ -359,7 +561,7 @@ public sealed class MainForm : Form
         _thumbnails.Images.Clear();
         for (int i = 0; i < _captures.Count; i++)
         {
-            AddThumbnail(_captures[i], i);
+            AddThumbnail(_captures[i].Bitmap, i);
         }
 
         _listView.EndUpdate();
@@ -368,13 +570,14 @@ public sealed class MainForm : Form
     private void ClearCaptures(bool disposeImages)
     {
         _preview.Image = null;
+        _preview.SetAnnotations([]);
         _listView.Items.Clear();
 
         if (disposeImages)
         {
-            foreach (Bitmap bitmap in _captures)
+            foreach (CaptureItem item in _captures)
             {
-                bitmap.Dispose();
+                item.Dispose();
             }
         }
 
@@ -388,7 +591,7 @@ public sealed class MainForm : Form
     }
 
     /// <summary>
-    /// 將目前紅框比例套用到暫存區每一張圖（只改記憶體，不存檔）。
+    /// 只把目前紅框比例套用到每一張圖。各圖自己的線條／矩形會跟著裁切座標轉換，不會互相複製。
     /// </summary>
     private void ApplyCropToAll()
     {
@@ -407,26 +610,25 @@ public sealed class MainForm : Form
         try
         {
             RectangleF ratio = ImageCropService.ClampNormalized(_preview.NormalizedCrop);
-            var cropped = new List<Bitmap>(_captures.Count);
-            foreach (Bitmap source in _captures)
-            {
-                cropped.Add(ImageCropService.CropByNormalized(source, ratio));
-            }
-
             int selected = Math.Max(0, GetSelectedIndex());
             _preview.Image = null;
-            foreach (Bitmap source in _captures)
+            _preview.SetAnnotations([]);
+
+            foreach (CaptureItem item in _captures)
             {
-                source.Dispose();
+                Bitmap cropped = ImageCropService.CropByNormalized(item.Bitmap, ratio);
+                List<ImageAnnotation> remapped = ImageAnnotationService.RemapToCrop(item.Annotations, ratio);
+                item.Bitmap.Dispose();
+                item.Bitmap = cropped;
+                item.Annotations.Clear();
+                item.Annotations.AddRange(remapped);
             }
 
-            _captures.Clear();
-            _captures.AddRange(cropped);
             _preview.ClearCrop();
             RebuildThumbnails();
             SelectIndex(Math.Min(selected, _captures.Count - 1));
             UpdateUiState();
-            _statusLabel.Text = $"已將裁切套用到全部 {_captures.Count} 張（未存檔）。";
+            _statusLabel.Text = $"已將裁切套用到全部 {_captures.Count} 張。標註仍各圖獨立，未互相套用。";
         }
         catch (Exception ex)
         {
@@ -435,8 +637,7 @@ public sealed class MainForm : Form
     }
 
     /// <summary>
-    /// 依目前紅框裁切「全部」暫存圖並複製。Windows 剪貼簿一次只能貼一張點陣圖，
-    /// 因此會先清空暫存資料夾再放入本次全部檔案；若 Excel 已開啟則一次插入全部圖片。
+    /// 複製時：各圖先依共用裁切區裁切，再畫上「該圖自己的」標註。
     /// </summary>
     private void CopyCurrentCropToClipboard()
     {
@@ -446,24 +647,28 @@ public sealed class MainForm : Form
             return;
         }
 
-        List<Bitmap>? generated = null;
-        IReadOnlyList<Bitmap> toCopy = _captures;
-
+        var generated = new List<Bitmap>();
         try
         {
-            if (_preview.HasCrop)
-            {
-                RectangleF ratio = ImageCropService.ClampNormalized(_preview.NormalizedCrop);
-                generated = [];
-                foreach (Bitmap source in _captures)
-                {
-                    generated.Add(ImageCropService.CropByNormalized(source, ratio));
-                }
+            RectangleF? crop = _preview.HasCrop
+                ? ImageCropService.ClampNormalized(_preview.NormalizedCrop)
+                : null;
 
-                toCopy = generated;
+            foreach (CaptureItem item in _captures)
+            {
+                if (crop is { } ratio)
+                {
+                    using Bitmap cropped = ImageCropService.CropByNormalized(item.Bitmap, ratio);
+                    List<ImageAnnotation> remapped = ImageAnnotationService.RemapToCrop(item.Annotations, ratio);
+                    generated.Add(ImageAnnotationService.CloneWithAnnotations(cropped, remapped));
+                }
+                else
+                {
+                    generated.Add(ImageAnnotationService.CloneWithAnnotations(item.Bitmap, item.Annotations));
+                }
             }
 
-            _statusLabel.Text = MultiImageClipboardService.CopyAll(toCopy);
+            _statusLabel.Text = MultiImageClipboardService.CopyAll(generated);
         }
         catch (Exception ex)
         {
@@ -471,12 +676,9 @@ public sealed class MainForm : Form
         }
         finally
         {
-            if (generated is not null)
+            foreach (Bitmap bitmap in generated)
             {
-                foreach (Bitmap bitmap in generated)
-                {
-                    bitmap.Dispose();
-                }
+                bitmap.Dispose();
             }
         }
     }
@@ -490,18 +692,23 @@ public sealed class MainForm : Form
             return;
         }
 
-        Bitmap source = _captures[index];
+        CaptureItem item = _captures[index];
+        Bitmap source = item.Bitmap;
+        string marks = item.Annotations.Count == 0
+            ? "此圖尚無標註"
+            : $"此圖標註 {item.Annotations.Count} 筆（僅屬於這張）";
+
         if (!_preview.HasCrop)
         {
-            _cropInfoLabel.Text = $"原圖 {source.Width}×{source.Height}。在圖上拖曳以建立裁切框。";
+            _cropInfoLabel.Text = $"原圖 {source.Width}×{source.Height}。{marks}。切換「裁切」可拉紅框。";
             return;
         }
 
         RectangleF n = _preview.NormalizedCrop;
         Rectangle px = ImageCropService.ToPixelRectangle(source.Size, n);
         _cropInfoLabel.Text =
-            $"比例 X={n.X:P1}  Y={n.Y:P1}  W={n.Width:P1}  H={n.Height:P1}　" +
-            $"目前圖像素 ({px.X}, {px.Y}, {px.Width}×{px.Height})";
+            $"裁切 X={n.X:P1} Y={n.Y:P1} W={n.Width:P1} H={n.Height:P1}　" +
+            $"像素 ({px.X}, {px.Y}, {px.Width}×{px.Height})　{marks}";
     }
 
     private void UpdateUiState()
